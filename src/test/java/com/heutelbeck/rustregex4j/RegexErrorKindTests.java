@@ -19,7 +19,7 @@ class RegexErrorKindTests {
         assertThat(RegexErrorKind.fromCode(kind.getCode())).isEqualTo(kind);
     }
 
-    @ValueSource(ints = { 0, 9, -1 })
+    @ValueSource(ints = { 0, 10, -1 })
     @ParameterizedTest(name = "code {0}")
     @DisplayName("a code the engine does not define is refused")
     void whenCodeIsUnknownThenItIsRefused(int code) {
@@ -30,6 +30,6 @@ class RegexErrorKindTests {
     @Test
     @DisplayName("the codes are the ones the engine reports")
     void whenCodesAreComparedWithTheEngineThenTheyAgree() {
-        assertThat(RegexErrorKind.values()).extracting(RegexErrorKind::getCode).containsExactly(1, 2, 3, 4, 5, 6, 7, 8);
+        assertThat(RegexErrorKind.values()).extracting(RegexErrorKind::getCode).containsExactly(1, 2, 3, 4, 5, 6, 7, 8, 9);
     }
 }

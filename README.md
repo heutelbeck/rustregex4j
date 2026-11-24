@@ -101,12 +101,30 @@ FindResult next = regex.find(text, previous.end());
 FindAllResult firstTen = regex.findAll(text, 10);
 CapturesAllResult groupsOfFirstTen = regex.capturesAll(text, 10);
 
-// Map group names to numbers, for replacements such as ${name}.
+// Map group names to numbers.
 OptionalInt year = regex.groupIndex("year");
 List<Optional<String>> names = regex.groupNames();
 ```
 
 Positions are UTF-16 indexes. A start outside the text or inside a surrogate pair, and a negative limit, yield a `RegexError` of kind `INVALID_ARGUMENT`.
+
+### Replacing and splitting
+
+```java
+Regex date = (Regex) Regex.compile("(?<day>[0-9]{2})\\.(?<month>[0-9]{2})\\.(?<year>[0-9]{4})");
+String iso = switch (date.replaceAll("due 24.11.2026", "${year}-${month}-${day}")) {
+    case Replaced(var result) -> result;
+    case RegexError error     -> "";
+};
+
+Regex comma = (Regex) Regex.compile(",");
+List<String> fields = switch (comma.split("a,b,,c", 100)) {
+    case Parts(var parts) -> parts;
+    case RegexError error -> List.of();
+};
+```
+
+Both behave as `replace_all` and `splitn` of the crate. In a replacement, `$1` and `${1}` insert a group by number, `$name` and `${name}` by name, and `$$` inserts `$`; every other character, the backslash included, stands for itself. A group that does not exist or did not participate inserts nothing. `$name` takes the longest name of letters, digits and `_`, so write `${1}a` for group 1 followed by `a`. A split keeps empty parts, also at the start and the end, and the last part holds the rest of the text once the limit is reached. A result of `replaceAll` longer than `maxTextBytes` is rejected as `RESULT_TOO_LONG`.
 
 ### Searching from many threads
 
@@ -169,6 +187,7 @@ Lengths are measured in UTF-8 bytes, so a limit means the same in Java and in Ru
 | `MALFORMED_UNICODE` | Pattern or text with an unpaired UTF-16 surrogate |
 | `TEXT_TOO_LONG` | Text longer than `maxTextBytes` |
 | `INVALID_ARGUMENT` | Start position outside the text or inside a surrogate pair, or negative limit |
+| `RESULT_TOO_LONG` | Result of `replaceAll` longer than `maxTextBytes` |
 | `INTERNAL` | Unexpected failure of the engine |
 
 Compiling checks the pattern length first, then well-formed UTF-16, then syntax and nesting, then the compiled size.

@@ -18,6 +18,8 @@ const ERROR_NESTING_TOO_DEEP: &str =
 const ERROR_PATTERN_TOO_LARGE: &str =
     "The compiled pattern exceeds the size limit of {value} bytes.";
 const ERROR_PATTERN_TOO_LONG: &str = "The pattern is longer than {value} UTF-8 bytes.";
+const ERROR_RESULT_TOO_LONG: &str =
+    "The result of the replacement is longer than {value} UTF-8 bytes.";
 const ERROR_TEXT_TOO_LONG: &str = "The text is longer than {value} UTF-8 bytes.";
 
 /// A compiled regular expression.
@@ -255,6 +257,56 @@ impl CompiledRegex {
             .collect())
     }
 
+    /// Replaces every successive non-overlapping match with `replacement`, as
+    /// [`Regex::replace_all`] does: `$1` and `${1}` insert a group by number, `$name` and
+    /// `${name}` by name, and `$$` inserts `$`. A group that does not exist or did not
+    /// participate inserts nothing. `$name` takes the longest name of letters, digits and
+    /// `_`, so `${1}a` is group 1 followed by `a`, while `$1a` is the group named `1a`.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::TextTooLong`] if the text or the replacement exceeds the text length
+    /// limit, [`ErrorKind::ResultTooLong`] if the result would.
+    pub fn replace_all(&self, text: &str, replacement: &str) -> Result<String, RegexError> {
+        self.check_text(text)?;
+        self.check_text(replacement)?;
+        let mut result = String::new();
+        let mut last = 0;
+        for groups in self.regex.captures_iter(text) {
+            let Some(found) = groups.get(0) else {
+                continue;
+            };
+            result.push_str(text.get(last..found.start()).unwrap_or_default());
+            groups.expand(replacement, &mut result);
+            last = found.end();
+            self.check_result(&result)?;
+        }
+        result.push_str(text.get(last..).unwrap_or_default());
+        self.check_result(&result)?;
+        Ok(result)
+    }
+
+    /// Splits the text at the matches into at most `limit` parts, as [`Regex::splitn`]
+    /// does: the text before the first match is the first part, also if it is empty, and
+    /// the last part holds the rest of the text.
+    ///
+    /// # Errors
+    ///
+    /// As [`CompiledRegex::is_match`].
+    pub fn split(&self, text: &str, limit: usize) -> Result<Vec<Span>, RegexError> {
+        self.check_text(text)?;
+        let start_of_text = text.as_ptr().addr();
+        let ranges: Vec<Option<(usize, usize)>> = self
+            .regex
+            .splitn(text, limit)
+            .map(|part| {
+                let start = part.as_ptr().addr() - start_of_text;
+                Some((start, start + part.len()))
+            })
+            .collect();
+        Ok(resolve_spans(text, &ranges).into_iter().flatten().collect())
+    }
+
     /// Decodes a text given as UTF-16 code units for searching.
     ///
     /// # Errors
@@ -262,6 +314,16 @@ impl CompiledRegex {
     /// [`ErrorKind::MalformedUnicode`] for an unpaired surrogate.
     pub fn decode_text(text: &[u16]) -> Result<String, RegexError> {
         decode_utf16(text, ERROR_MALFORMED_TEXT)
+    }
+
+    fn check_result(&self, result: &str) -> Result<(), RegexError> {
+        if result.len() > self.max_text_bytes {
+            return Err(RegexError::new(
+                ErrorKind::ResultTooLong,
+                with_value(ERROR_RESULT_TOO_LONG, self.max_text_bytes),
+            ));
+        }
+        Ok(())
     }
 
     fn check_text(&self, text: &str) -> Result<(), RegexError> {

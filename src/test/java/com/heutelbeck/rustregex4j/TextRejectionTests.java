@@ -33,7 +33,7 @@ class TextRejectionTests {
     void whenTextIsRejectedThenEverySearchYieldsTheError(String description, String text, RegexErrorKind kind) {
         val regex = compiled("b");
         assertThat(new Object[] { regex.isMatch(text), regex.find(text), regex.findAll(text), regex.captures(text),
-                regex.capturesAll(text, 1) })
+                regex.capturesAll(text, 1), regex.replaceAll(text, "c"), regex.split(text, 2) })
                 .allSatisfy(result -> assertThat(result).isInstanceOfSatisfying(RegexError.class,
                         error -> assertThat(error.kind()).isEqualTo(kind)));
     }

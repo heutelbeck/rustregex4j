@@ -7,6 +7,7 @@
 mod allocation;
 mod compilation;
 mod memory;
+mod replace_and_split;
 mod search;
 mod whole_text_and_iteration;
 

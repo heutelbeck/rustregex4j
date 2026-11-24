@@ -25,6 +25,8 @@ pub enum ErrorKind {
     Internal = 7,
     /// A start offset lies outside the text or inside a UTF-16 surrogate pair.
     InvalidArgument = 8,
+    /// The result of a replacement would be longer than the text length limit.
+    ResultTooLong = 9,
 }
 
 impl ErrorKind {

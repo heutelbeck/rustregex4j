@@ -63,6 +63,22 @@ class ReadmeExamplesTests {
     }
 
     @Test
+    @DisplayName("replacing and splitting")
+    void whenReplacingAndSplittingThenResultsAreAsDescribed() {
+        Regex date = (Regex) Regex.compile("(?<day>[0-9]{2})\\.(?<month>[0-9]{2})\\.(?<year>[0-9]{4})");
+        String iso = switch (date.replaceAll("due 24.11.2026", "${year}-${month}-${day}")) {
+        case Replaced(var result) -> result;
+        case RegexError error     -> "";
+        };
+        Regex comma = (Regex) Regex.compile(",");
+        List<String> fields = switch (comma.split("a,b,,c", 100)) {
+        case Parts(var parts) -> parts;
+        case RegexError error -> List.of();
+        };
+        assertThat(List.of(iso, fields)).containsExactly("due 2026-11-24", List.of("a", "b", "", "c"));
+    }
+
+    @Test
     @DisplayName("matching the whole text")
     void whenCompilingForTheWholeTextThenOnlySpanningMatchesCount() {
         Regex identifier = (Regex) Regex.compileWholeText("[a-z]{3}-[0-9]{6}");

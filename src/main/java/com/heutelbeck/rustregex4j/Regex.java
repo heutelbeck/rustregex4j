@@ -44,6 +44,8 @@ import lombok.val;
  *     case RegexError error     -> false;
  * };
  * }</pre>
+ * {@link #replaceAll(String, String)} and {@link #split(String, int)} replace and split as
+ * the Rust crate does, with its syntax of replacements.
  *
  * <h2>Engine configuration</h2>
  * The defaults of the {@code regex} crate: Unicode mode, case sensitive, {@code ^} and
@@ -70,6 +72,8 @@ public final class Regex implements RegexCompilation {
     private static final String ERROR_NEGATIVE_LIMIT   = "The limit %d must not be negative.";
     private static final String ERROR_PATTERN_TOO_LONG = "The pattern is longer than %d UTF-8 bytes.";
     private static final String ERROR_PATTERN_NULL     = "The pattern must not be null.";
+    private static final String ERROR_REPLACEMENT_NULL = "The replacement must not be null.";
+    private static final String ERROR_RESULT_TOO_LONG  = "The result of the replacement is longer than %d UTF-8 bytes.";
     private static final String ERROR_TEXT_NULL        = "The text must not be null.";
     private static final String ERROR_TEXT_TOO_LONG    = "The text is longer than %d UTF-8 bytes.";
 
@@ -438,6 +442,79 @@ public final class Regex implements RegexCompilation {
     }
 
     /**
+     * Replaces every successive non-overlapping match, as {@code Regex::replace_all} of the
+     * Rust crate does.
+     * <p>
+     * In the replacement, {@code $1} and {@code ${1}} insert a group by number,
+     * {@code $name} and {@code ${name}} insert a group by name, and {@code $$} inserts
+     * {@code $}. A group that does not exist or did not participate in the match inserts
+     * nothing. {@code $name} takes the longest name of letters, digits and {@code _}, so
+     * {@code ${1}a} is group 1 followed by {@code a}, while {@code $1a} is the group named
+     * {@code 1a}. Every other character, the backslash included, stands for itself.
+     *
+     * @param text the text to search
+     * @param replacement the replacement of each match
+     * @return {@link Replaced} with the result, or a {@link RegexError} if the text or the
+     *         replacement is rejected, or the result would be longer than
+     *         {@link RegexLimits#maxTextBytes()} ({@link RegexErrorKind#RESULT_TOO_LONG})
+     * @throws NullPointerException if an argument is null
+     */
+    public ReplaceResult replaceAll(String text, String replacement) {
+        requireNonNull(replacement, ERROR_REPLACEMENT_NULL);
+        val textRejection = rejectionOf(text);
+        val rejection     = textRejection != null ? textRejection : rejectionOf(replacement);
+        if (rejection != null) {
+            return rejection;
+        }
+        try {
+            val result = new String[1];
+            val status = RegexEngine.replaceAll(pointer, text, replacement, result);
+            if (status < 0) {
+                return errorOf(status, 0);
+            }
+            return new Replaced(requireNonNullElse(result[0], ""));
+        } finally {
+            Reference.reachabilityFence(this);
+        }
+    }
+
+    /**
+     * Splits the text at the successive non-overlapping matches into at most {@code limit}
+     * parts, as {@code Regex::splitn} of the Rust crate does.
+     * <p>
+     * The text before the first match is the first part and the text after the last match
+     * the last part, also if they are empty, so that {@code ,} splits {@code ,a,} into
+     * {@code ""}, {@code "a"} and {@code ""}. The last part holds the rest of the text once
+     * the limit is reached.
+     *
+     * @param text the text to split
+     * @param limit the maximum number of parts
+     * @return {@link Parts} in text order, or a {@link RegexError} if the text is rejected
+     *         or {@code limit} is negative ({@link RegexErrorKind#INVALID_ARGUMENT})
+     * @throws NullPointerException if {@code text} is null
+     */
+    public SplitResult split(String text, int limit) {
+        val rejection = rejectionOf(text, 0, limit);
+        if (rejection != null) {
+            return rejection;
+        }
+        try {
+            val values = RegexEngine.split(pointer, text, limit);
+            val count  = values[0];
+            if (count < 0) {
+                return errorOf(count, 0);
+            }
+            val parts = new ArrayList<String>(count);
+            for (var index = 0; index < count; index++) {
+                parts.add(matchAt(values, 1 + index * SPAN_VALUES).of(text));
+            }
+            return new Parts(parts);
+        } finally {
+            Reference.reachabilityFence(this);
+        }
+    }
+
+    /**
      * Returns the pattern.
      *
      * @return the pattern this regex was compiled from
@@ -491,6 +568,7 @@ public final class Regex implements RegexCompilation {
         case TEXT_TOO_LONG     -> new RegexError(kind, ERROR_TEXT_TOO_LONG.formatted(limits.maxTextBytes()));
         case MALFORMED_UNICODE -> new RegexError(kind, ERROR_MALFORMED_TEXT);
         case INVALID_ARGUMENT  -> new RegexError(kind, ERROR_INVALID_START.formatted(start));
+        case RESULT_TOO_LONG   -> new RegexError(kind, ERROR_RESULT_TOO_LONG.formatted(limits.maxTextBytes()));
         default                -> new RegexError(kind, ERROR_INTERNAL);
         };
     }

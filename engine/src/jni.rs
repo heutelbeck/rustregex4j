@@ -372,6 +372,63 @@ extern "system" fn Java_com_heutelbeck_rustregex4j_RegexEngine_capturesAll(
     }
 }
 
+/// Replaces all matches and stores the result in `result[0]`: `1`, or a negated
+/// [`ErrorKind`] code.
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_heutelbeck_rustregex4j_RegexEngine_replaceAll(
+    env: *mut JNIEnv,
+    _class: jclass,
+    pointer: jlong,
+    text: jstring,
+    replacement: jstring,
+    result: jobjectArray,
+) -> jint {
+    let replaced = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the Java side passes a live pointer and live, non-null strings.
+        let (regex, text_units, replacement_units) = unsafe {
+            (
+                regex(pointer),
+                read_string(env, text),
+                read_string(env, replacement),
+            )
+        };
+        let text = CompiledRegex::decode_text(&text_units)?;
+        let replacement = CompiledRegex::decode_text(&replacement_units)?;
+        regex.replace_all(&text, &replacement)
+    }))
+    .unwrap_or_else(|_| Err(RegexError::new(ErrorKind::Internal, ERROR_PANIC)));
+    match replaced {
+        Ok(replaced) => {
+            // SAFETY: the Java side passes a live String[1].
+            unsafe { store_message(env, result, &replaced) };
+            1
+        }
+        Err(error) => status_of(error.kind),
+    }
+}
+
+/// Splits the text into at most `limit` parts: `[count, span, span, ...]` or
+/// `[negated error code]`.
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_heutelbeck_rustregex4j_RegexEngine_split(
+    env: *mut JNIEnv,
+    _class: jclass,
+    pointer: jlong,
+    text: jstring,
+    limit: jint,
+) -> jintArray {
+    // SAFETY: the Java side passes a live pointer and a live, non-null string.
+    unsafe {
+        search(env, pointer, text, |regex, text| {
+            let parts = regex.split(text, usize::try_from(limit).unwrap_or(0))?;
+            let mut values = Vec::with_capacity(1 + SPAN_VALUES * parts.len());
+            values.push(to_jint(parts.len()));
+            values.extend(parts.iter().flat_map(span_values));
+            Ok(values)
+        })
+    }
+}
+
 /// Returns the number of compiled regexes not yet freed.
 #[unsafe(no_mangle)]
 extern "system" fn Java_com_heutelbeck_rustregex4j_RegexEngine_liveRegexes(

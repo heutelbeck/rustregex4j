@@ -14,7 +14,8 @@ import static java.util.Objects.requireNonNull;
  *        which points at the offending part of the pattern
  */
 public record RegexError(RegexErrorKind kind, String message)
-        implements RegexCompilation, IsMatchResult, FindResult, FindAllResult, CapturesResult, CapturesAllResult {
+        implements RegexCompilation, IsMatchResult, FindResult, FindAllResult, CapturesResult, CapturesAllResult,
+        ReplaceResult, SplitResult {
 
     private static final String ERROR_KIND_NULL    = "The error kind must not be null.";
     private static final String ERROR_MESSAGE_NULL = "The error message must not be null.";

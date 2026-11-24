@@ -49,6 +49,12 @@ final class RegexEngine {
     /** @return {@code [match count, group count, (present, span)... per match]} of at most {@code limit} matches */
     static native int[] capturesAll(long pointer, String text, int limit);
 
+    /** Stores the result in {@code result[0]}; @return {@code 1} or a negated error kind code */
+    static native int replaceAll(long pointer, String text, String replacement, String[] result);
+
+    /** @return {@code [count, span...]} of at most {@code limit} parts, or {@code [negated error kind code]} */
+    static native int[] split(long pointer, String text, int limit);
+
     /** @return the number of compiled regexes not yet freed */
     static native long liveRegexes();
 }

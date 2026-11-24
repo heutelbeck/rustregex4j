@@ -28,7 +28,9 @@ public enum RegexErrorKind {
     /** The regex engine failed unexpectedly. */
     INTERNAL(7),
     /** A start position lies outside the text or inside a surrogate pair, or a limit is negative. */
-    INVALID_ARGUMENT(8);
+    INVALID_ARGUMENT(8),
+    /** The result of a replacement would be longer than {@link RegexLimits#maxTextBytes()}. */
+    RESULT_TOO_LONG(9);
 
     private static final String ERROR_UNKNOWN_CODE = "Unknown error kind code %d.";
 
