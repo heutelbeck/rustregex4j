@@ -1,0 +1,19 @@
+# Checks of the dependencies: cargo deny check
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Unicode-3.0 covers unicode-ident, a build-time dependency of the jni-sys macros.
+allow = ["MIT", "Apache-2.0", "Unlicense", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

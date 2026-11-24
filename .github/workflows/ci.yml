@@ -1,0 +1,292 @@
+name: CI
+
+# Builds the engine on every supported platform, runs the Rust and Java tests there on the JVM
+# and, where GraalVM exists for the platform, as the native image the SAPL builds use, and
+# assembles one jar with the engines of all platforms. On Linux the engines are built against
+# glibc 2.17 and, for JVMs on musl systems such as Alpine, against musl; the Java tests also run
+# on Alpine and on Amazon Linux 2 (glibc 2.26).
+#
+# A push to main attaches the snapshot jars to the GitHub release "snapshot". A tag v<version>
+# releases that version: it signs the jars, publishes them to Maven Central and attaches them
+# to the GitHub release of the tag. The release needs the repository secrets OSSRH_USERNAME,
+# OSSRH_PASSWORD (Central Portal token), OSSRH_GPG_SECRET_KEY and
+# OSSRH_GPG_SECRET_KEY_PASSWORD.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  MAVEN_ARGS: -B -ntp
+
+jobs:
+  platform:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            classifier: linux-x86_64
+            native-profile: native-static
+            rust-arch: x86_64
+            jdk-arch: x64
+            zig-sha256: 3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
+          - name: Linux aarch64
+            os: ubuntu-24.04-arm
+            classifier: linux-aarch_64
+            native-profile: native-mostly-static
+            rust-arch: aarch64
+            jdk-arch: aarch64
+            zig-sha256: a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795
+          - name: macOS aarch64
+            os: macos-15
+            classifier: osx-aarch_64
+            native-profile: native
+          # GraalVM 25 does not exist for macOS on Intel, so the tests run on the JVM only.
+          - name: macOS x86_64
+            os: macos-15-intel
+            classifier: osx-x86_64
+            native-profile: ''
+          - name: Windows x86_64
+            os: windows-2025
+            classifier: windows-x86_64
+            native-profile: native
+    defaults:
+      run:
+        shell: bash
+    env:
+      ZIG_VERSION: 0.17.1
+      ENGINE_PROFILES: ${{ startsWith(matrix.classifier, 'linux-') && '-Pportable-linux-engines' || '' }}
+    steps:
+      # The agent of Harden-Runner supports Linux runners only.
+      - name: Harden Runner
+        if: runner.os == 'Linux'
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install musl tools for the fully static native image
+        if: matrix.native-profile == 'native-static'
+        run: |
+          sudo apt-get -o DPkg::Lock::Timeout=120 update
+          sudo apt-get -o DPkg::Lock::Timeout=120 install -y build-essential musl-dev musl-tools
+          # GraalVM calls x86_64-linux-musl-gcc.
+          sudo ln -sf /usr/bin/musl-gcc /usr/local/bin/x86_64-linux-musl-gcc
+          # A static native image links zlib; take a musl build of it from Alpine.
+          docker run --rm -v /tmp/alpine-zlib:/out alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf sh -c 'apk add --no-cache zlib-static && cp /usr/lib/libz.a /out/'
+          sudo cp /tmp/alpine-zlib/libz.a "/usr/lib/$(uname -m)-linux-musl/"
+
+      - name: Use the MSVC linker instead of the link of Git Bash
+        if: runner.os == 'Windows'
+        run: rm -f /usr/bin/link /usr/bin/link.exe
+
+      - name: Install Rust toolchain
+        working-directory: engine
+        run: rustup toolchain install
+
+      - name: Install the Rust targets of the portable Linux engines
+        if: runner.os == 'Linux'
+        working-directory: engine
+        run: rustup target add ${{ matrix.rust-arch }}-unknown-linux-gnu ${{ matrix.rust-arch }}-unknown-linux-musl
+
+      - name: Install zig for the portable Linux engines
+        if: runner.os == 'Linux'
+        run: |
+          archive="zig-${{ matrix.rust-arch }}-linux-$ZIG_VERSION.tar.xz"
+          curl -fsSL -o "/tmp/$archive" "https://ziglang.org/download/$ZIG_VERSION/$archive"
+          echo "${{ matrix.zig-sha256 }}  /tmp/$archive" | sha256sum --check
+          mkdir -p "$HOME/zig"
+          tar -xJf "/tmp/$archive" -C "$HOME/zig" --strip-components 1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+
+      - name: Install cargo-zigbuild
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-zigbuild@0.24.1
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: engine -> ../target/engine
+
+      - name: Set up GraalVM
+        if: matrix.native-profile != ''
+        uses: graalvm/setup-graalvm@60e76998d25690099182b796e99b8804da582d90 # v1.6.10
+        with:
+          version: '25.0.5.0.3'
+          java-version: '25'
+          distribution: graalvm
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache: maven
+
+      - name: Set up JDK 25 where GraalVM does not exist
+        if: matrix.native-profile == ''
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Install cargo-deny
+        if: matrix.classifier == 'linux-x86_64'
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-deny@0.22.0
+
+      - name: Check Rust formatting, lints and dependencies
+        if: matrix.classifier == 'linux-x86_64'
+        working-directory: engine
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets
+          cargo deny check
+
+      - name: Build and test on the JVM
+        run: mvn $ENGINE_PROFILES verify
+
+      - name: Check that the static engine carries its own unwinder
+        if: matrix.classifier == 'linux-x86_64'
+        run: nm target/classes/com/heutelbeck/rustregex4j/engine/linux-x86_64-musl/librustregex4j.a | grep -q ' T _Unwind_RaiseException$'
+
+      - name: Test on the JVM of Alpine with the musl engine
+        if: runner.os == 'Linux'
+        run: docker run --rm -v "$PWD":/src:ro -v "$HOME/.m2/repository":/m2:ro -v "$PWD/.github/scripts":/scripts:ro alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf sh -c 'apk add -q --no-cache openjdk21-jdk maven && sh /scripts/test-in-container.sh'
+
+      - name: Test on the JVM of Amazon Linux 2 with glibc 2.26
+        if: runner.os == 'Linux'
+        run: docker run --rm -e JDK_ARCH=${{ matrix.jdk-arch }} -v "$PWD":/src:ro -v "$HOME/.m2/repository":/m2:ro -v "$PWD/.github/scripts":/scripts:ro amazonlinux:2@sha256:fe781eddcb2fb31e515d3c45f79a1e13e3ff4519d903246164d54cdabbe0c117 sh -c 'yum install -q -y tar gzip && sh /scripts/install-jdk-and-maven.sh && PATH=/opt/jdk/bin:/opt/maven/bin:$PATH JAVA_HOME=/opt/jdk sh /scripts/test-in-container.sh'
+
+      - name: Test as native image
+        if: matrix.native-profile != ''
+        run: mvn $ENGINE_PROFILES -P${{ matrix.native-profile }} test
+
+      - name: Show what the engine library links against
+        run: |
+          directory="target/classes/com/heutelbeck/rustregex4j/engine/${{ matrix.classifier }}"
+          ls -l "$directory"
+          case "${{ runner.os }}" in
+            Linux)
+              for library in "$directory/librustregex4j.so" "$directory-musl/librustregex4j.so"; do
+                echo "$library:"
+                readelf -d "$library" | grep NEEDED
+                if readelf -d "$library" | grep NEEDED | grep -q libgcc_s; then echo "The engine $library needs libgcc_s."; exit 1; fi
+              done
+              newest=$(objdump -T "$directory/librustregex4j.so" | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)
+              echo "Newest glibc symbol version: $newest"
+              printf '%s\n' "$newest" GLIBC_2.17 | sort -V -C || { echo "The glibc engine needs a glibc newer than 2.17."; exit 1; }
+              if readelf -d "$directory-musl/librustregex4j.so" | grep NEEDED | grep -v '\[libc.so\]'; then echo "The musl engine needs more than libc.so."; exit 1; fi
+              ;;
+            macOS)
+              otool -L "$directory/librustregex4j.dylib"
+              ;;
+            Windows)
+              objdump -p "$directory/rustregex4j.dll" | grep 'DLL Name' || true
+              ;;
+          esac
+
+      - name: Upload engine
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: engine-${{ matrix.classifier }}
+          path: target/classes/com/heutelbeck/rustregex4j/engine/${{ matrix.classifier }}*/
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    name: Assemble and publish snapshot
+    needs: platform
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK 21, the oldest supported version
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          server-id: central
+          server-username-env-var: MAVEN_USERNAME
+          server-password-env-var: MAVEN_PASSWORD
+
+      - name: Set the release version from the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: mvn versions:set -DnewVersion="${GITHUB_REF_NAME#v}" -DgenerateBackupPoms=false
+
+      - name: Download engines of all platforms
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: engine-*
+          path: engines
+          merge-multiple: true
+
+      - name: Assemble the jar and test it on JDK 21
+        run: |
+          find engines -type f | sort
+          mvn -Pprebuilt-engines,release -Dengine.libraries="$PWD/engines" -Dgpg.skip verify
+
+      - name: Check that the jar carries the engine of every platform
+        run: |
+          version=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
+          jar="target/rustregex4j-$version.jar"
+          for library in linux-x86_64/librustregex4j.so linux-x86_64-musl/librustregex4j.so linux-x86_64-musl/librustregex4j.a linux-aarch_64/librustregex4j.so linux-aarch_64-musl/librustregex4j.so osx-aarch_64/librustregex4j.dylib osx-x86_64/librustregex4j.dylib windows-x86_64/rustregex4j.dll; do
+            unzip -l "$jar" "com/heutelbeck/rustregex4j/engine/$library" > /dev/null || { echo "Missing engine $library in $jar."; exit 1; }
+          done
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Publish the snapshot jars as assets of the release "snapshot"
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete snapshot --cleanup-tag --yes || true
+          gh release create snapshot --prerelease --target "$GITHUB_SHA" --title "rustregex4j $VERSION" --notes "Snapshot built from $GITHUB_SHA. The jar carries the engine for Linux x86_64 and aarch64 (glibc 2.17 or newer, and musl; for x86_64 also static for musl), macOS aarch64 and x86_64, and Windows x86_64." "target/rustregex4j-$VERSION.jar" "target/rustregex4j-$VERSION-sources.jar" "target/rustregex4j-$VERSION-javadoc.jar"
+
+      - name: Import the GPG signing key
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GPG_SECRET_KEY: ${{ secrets.OSSRH_GPG_SECRET_KEY }}
+        run: |
+          echo "$GPG_SECRET_KEY" | gpg --batch --import
+          gpg --list-secret-keys --keyid-format LONG
+
+      - name: Sign and publish the release to Maven Central
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          MAVEN_USERNAME: ${{ secrets.OSSRH_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.OSSRH_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.OSSRH_GPG_SECRET_KEY_PASSWORD }}
+        run: mvn -Pprebuilt-engines,release -Dengine.libraries="$PWD/engines" -DskipTests deploy
+
+      - name: Attach the release jars to the GitHub release of the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "rustregex4j $VERSION" --generate-notes "target/rustregex4j-$VERSION.jar" "target/rustregex4j-$VERSION.jar.asc" "target/rustregex4j-$VERSION-sources.jar" "target/rustregex4j-$VERSION-sources.jar.asc" "target/rustregex4j-$VERSION-javadoc.jar" "target/rustregex4j-$VERSION-javadoc.jar.asc"

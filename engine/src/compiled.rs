@@ -1,0 +1,344 @@
+//! A compiled pattern and the searches on it.
+
+use regex::{Regex, RegexBuilder};
+use regex_syntax::ParserBuilder;
+use regex_syntax::ast;
+use regex_syntax::hir::{Hir, Look};
+
+use crate::error::{ErrorKind, RegexError};
+use crate::limits::Limits;
+use crate::positions::{Span, resolve_spans};
+
+const ERROR_INVALID_START: &str =
+    "The start {value} lies outside the text or inside a UTF-16 surrogate pair.";
+const ERROR_MALFORMED_PATTERN: &str = "The pattern contains an unpaired UTF-16 surrogate.";
+const ERROR_MALFORMED_TEXT: &str = "The text contains an unpaired UTF-16 surrogate.";
+const ERROR_NESTING_TOO_DEEP: &str =
+    "The pattern nests groups, classes or repetitions deeper than {value} levels.";
+const ERROR_PATTERN_TOO_LARGE: &str =
+    "The compiled pattern exceeds the size limit of {value} bytes.";
+const ERROR_PATTERN_TOO_LONG: &str = "The pattern is longer than {value} UTF-8 bytes.";
+const ERROR_TEXT_TOO_LONG: &str = "The text is longer than {value} UTF-8 bytes.";
+
+/// A compiled regular expression.
+///
+/// The engine is configured with the defaults of the `regex` crate: Unicode mode, case
+/// sensitive, `^` and `$` match at the start and end of the text, `.` does not match `\n`,
+/// leftmost-first match semantics. Patterns change this only with inline flags such as
+/// `(?i)`, `(?m)`, `(?s)`, `(?x)`, `(?U)` and `(?-u)`.
+///
+/// A compiled regex is immutable and can be searched from many threads at the same time.
+#[derive(Debug, Clone)]
+pub struct CompiledRegex {
+    regex: Regex,
+    max_text_bytes: usize,
+    group_names: Vec<Option<String>>,
+}
+
+/// The groups of a match, group 0 first. A group that did not participate is `None`.
+pub type Captures = Vec<Option<Span>>;
+
+/// Where a pattern must match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Anchoring {
+    /// A match may lie anywhere in the text.
+    Anywhere,
+    /// A match must span the whole text.
+    WholeText,
+}
+
+impl CompiledRegex {
+    /// Compiles a pattern whose matches may lie anywhere in a text.
+    ///
+    /// # Errors
+    ///
+    /// The checks run in this order: pattern length, syntax and nesting depth, size of the
+    /// compiled pattern.
+    pub fn compile(pattern: &str, limits: &Limits) -> Result<CompiledRegex, RegexError> {
+        CompiledRegex::compile_anchored(pattern, limits, Anchoring::Anywhere)
+    }
+
+    /// Compiles a pattern that must match where `anchoring` says.
+    ///
+    /// For [`Anchoring::WholeText`] the pattern is checked as written, then its syntax tree
+    /// is enclosed in the assertions `\A` and `\z` and compiled from its canonical text.
+    /// Enclosing the text of the pattern instead would let the pattern escape the
+    /// enclosure, for example `a)(b`, or a comment in `(?x)` mode that swallows the
+    /// closing parenthesis.
+    ///
+    /// # Errors
+    ///
+    /// As [`CompiledRegex::compile`].
+    pub fn compile_anchored(
+        pattern: &str,
+        limits: &Limits,
+        anchoring: Anchoring,
+    ) -> Result<CompiledRegex, RegexError> {
+        if pattern.len() > limits.max_pattern_bytes {
+            return Err(RegexError::new(
+                ErrorKind::PatternTooLong,
+                with_value(ERROR_PATTERN_TOO_LONG, limits.max_pattern_bytes),
+            ));
+        }
+        let hir = ParserBuilder::new()
+            .nest_limit(limits.nest_limit)
+            .build()
+            .parse(pattern)
+            .map_err(|error| classify_syntax_error(&error, limits))?;
+        let compiled_pattern = match anchoring {
+            Anchoring::Anywhere => pattern.to_owned(),
+            Anchoring::WholeText => {
+                Hir::concat(vec![Hir::look(Look::Start), hir, Hir::look(Look::End)]).to_string()
+            }
+        };
+        // The parser above already enforced the nest limit on the pattern as written. The
+        // canonical text that the builder parses again may nest deeper, for example by the
+        // group that encloses the anchors, so the builder gets headroom and never rejects
+        // what the parser admitted.
+        let regex = RegexBuilder::new(&compiled_pattern)
+            .nest_limit(limits.nest_limit.saturating_mul(2).saturating_add(2))
+            .size_limit(limits.size_limit)
+            .dfa_size_limit(limits.dfa_size_limit)
+            .build()
+            .map_err(|error| match error {
+                regex::Error::CompiledTooBig(limit) => RegexError::new(
+                    ErrorKind::PatternTooLarge,
+                    with_value(ERROR_PATTERN_TOO_LARGE, limit),
+                ),
+                other => RegexError::new(ErrorKind::Syntax, other.to_string()),
+            })?;
+        let group_names = regex
+            .capture_names()
+            .map(|name| name.map(str::to_owned))
+            .collect();
+        Ok(CompiledRegex {
+            regex,
+            max_text_bytes: limits.max_text_bytes,
+            group_names,
+        })
+    }
+
+    /// Compiles a pattern given as UTF-16 code units.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::MalformedUnicode`] for an unpaired surrogate, otherwise as
+    /// [`CompiledRegex::compile`].
+    pub fn compile_utf16(
+        pattern: &[u16],
+        limits: &Limits,
+        anchoring: Anchoring,
+    ) -> Result<CompiledRegex, RegexError> {
+        let pattern = decode_utf16(pattern, ERROR_MALFORMED_PATTERN)?;
+        CompiledRegex::compile_anchored(&pattern, limits, anchoring)
+    }
+
+    /// Returns the number of capture groups including the implicit group 0.
+    #[must_use]
+    pub fn group_count(&self) -> usize {
+        self.regex.captures_len()
+    }
+
+    /// Returns the name of every group in group order; `None` for group 0 and for unnamed
+    /// groups.
+    #[must_use]
+    pub fn group_names(&self) -> &[Option<String>] {
+        &self.group_names
+    }
+
+    /// Reports whether the pattern matches.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::TextTooLong`] if the text exceeds the text length limit.
+    pub fn is_match(&self, text: &str) -> Result<bool, RegexError> {
+        self.check_text(text)?;
+        Ok(self.regex.is_match(text))
+    }
+
+    /// Returns the leftmost-first match.
+    ///
+    /// # Errors
+    ///
+    /// As [`CompiledRegex::is_match`].
+    pub fn find(&self, text: &str) -> Result<Option<Span>, RegexError> {
+        self.find_at(text, 0)
+    }
+
+    /// Returns the leftmost-first match that starts at or after the byte offset `start`.
+    ///
+    /// The search sees the whole text, so anchors and word boundaries behave as in a search
+    /// from the start of the text: `^` does not match at `start` unless `start` is 0.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::TextTooLong`], or [`ErrorKind::InvalidArgument`] if `start` is not a
+    /// character boundary of the text.
+    pub fn find_at(&self, text: &str, start: usize) -> Result<Option<Span>, RegexError> {
+        self.check_text(text)?;
+        check_start(text, start)?;
+        let range = self
+            .regex
+            .find_at(text, start)
+            .map(|found| (found.start(), found.end()));
+        Ok(resolve_spans(text, &[range]).into_iter().flatten().next())
+    }
+
+    /// Returns all successive non-overlapping matches.
+    ///
+    /// # Errors
+    ///
+    /// As [`CompiledRegex::is_match`].
+    pub fn find_all(&self, text: &str) -> Result<Vec<Span>, RegexError> {
+        self.find_all_limited(text, usize::MAX)
+    }
+
+    /// Returns the first `limit` successive non-overlapping matches; the search stops after
+    /// the last of them.
+    ///
+    /// # Errors
+    ///
+    /// As [`CompiledRegex::is_match`].
+    pub fn find_all_limited(&self, text: &str, limit: usize) -> Result<Vec<Span>, RegexError> {
+        self.check_text(text)?;
+        let ranges: Vec<Option<(usize, usize)>> = self
+            .regex
+            .find_iter(text)
+            .take(limit)
+            .map(|found| Some((found.start(), found.end())))
+            .collect();
+        Ok(resolve_spans(text, &ranges).into_iter().flatten().collect())
+    }
+
+    /// Returns the groups of the leftmost-first match.
+    ///
+    /// # Errors
+    ///
+    /// As [`CompiledRegex::is_match`].
+    pub fn captures(&self, text: &str) -> Result<Option<Captures>, RegexError> {
+        self.captures_at(text, 0)
+    }
+
+    /// Returns the groups of the leftmost-first match that starts at or after the byte
+    /// offset `start`; anchors behave as in [`CompiledRegex::find_at`].
+    ///
+    /// # Errors
+    ///
+    /// As [`CompiledRegex::find_at`].
+    pub fn captures_at(&self, text: &str, start: usize) -> Result<Option<Captures>, RegexError> {
+        self.check_text(text)?;
+        check_start(text, start)?;
+        let Some(groups) = self.regex.captures_at(text, start) else {
+            return Ok(None);
+        };
+        Ok(Some(resolve_spans(text, &group_ranges(&groups))))
+    }
+
+    /// Returns the groups of the first `limit` successive non-overlapping matches; the
+    /// search stops after the last of them.
+    ///
+    /// # Errors
+    ///
+    /// As [`CompiledRegex::is_match`].
+    pub fn captures_all(&self, text: &str, limit: usize) -> Result<Vec<Captures>, RegexError> {
+        self.check_text(text)?;
+        let ranges: Vec<Option<(usize, usize)>> = self
+            .regex
+            .captures_iter(text)
+            .take(limit)
+            .flat_map(|groups| group_ranges(&groups))
+            .collect();
+        let spans = resolve_spans(text, &ranges);
+        Ok(spans
+            .chunks(self.group_count().max(1))
+            .map(<[Option<Span>]>::to_vec)
+            .collect())
+    }
+
+    /// Decodes a text given as UTF-16 code units for searching.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::MalformedUnicode`] for an unpaired surrogate.
+    pub fn decode_text(text: &[u16]) -> Result<String, RegexError> {
+        decode_utf16(text, ERROR_MALFORMED_TEXT)
+    }
+
+    fn check_text(&self, text: &str) -> Result<(), RegexError> {
+        if text.len() > self.max_text_bytes {
+            return Err(RegexError::new(
+                ErrorKind::TextTooLong,
+                with_value(ERROR_TEXT_TOO_LONG, self.max_text_bytes),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Converts a UTF-16 offset into the byte offset of the same position in `text`; `None` if
+/// it lies beyond the text or inside a surrogate pair.
+#[must_use]
+pub fn byte_offset_of_utf16(text: &str, utf16_offset: usize) -> Option<usize> {
+    let mut units = 0usize;
+    for (byte, character) in text.char_indices() {
+        if units == utf16_offset {
+            return Some(byte);
+        }
+        units += character.len_utf16();
+        if units > utf16_offset {
+            return None;
+        }
+    }
+    (units == utf16_offset).then_some(text.len())
+}
+
+fn group_ranges(groups: &regex::Captures<'_>) -> Vec<Option<(usize, usize)>> {
+    groups
+        .iter()
+        .map(|group| group.map(|found| (found.start(), found.end())))
+        .collect()
+}
+
+fn check_start(text: &str, start: usize) -> Result<(), RegexError> {
+    if text.is_char_boundary(start) {
+        return Ok(());
+    }
+    Err(invalid_start(start))
+}
+
+/// The error for a start offset outside the text or inside a character.
+pub(crate) fn invalid_start(start: impl std::fmt::Display) -> RegexError {
+    RegexError::new(
+        ErrorKind::InvalidArgument,
+        with_value(ERROR_INVALID_START, start),
+    )
+}
+
+/// Decodes UTF-16 strictly: an unpaired surrogate is an error, never replaced.
+fn decode_utf16(units: &[u16], message: &str) -> Result<String, RegexError> {
+    let mut decoded = String::with_capacity(units.len());
+    for character in char::decode_utf16(units.iter().copied()) {
+        match character {
+            Ok(character) => decoded.push(character),
+            Err(_) => return Err(RegexError::new(ErrorKind::MalformedUnicode, message)),
+        }
+    }
+    Ok(decoded)
+}
+
+fn classify_syntax_error(error: &regex_syntax::Error, limits: &Limits) -> RegexError {
+    if let regex_syntax::Error::Parse(parse) = error
+        && let ast::ErrorKind::NestLimitExceeded(_) = parse.kind()
+    {
+        return RegexError::new(
+            ErrorKind::NestingTooDeep,
+            with_value(ERROR_NESTING_TOO_DEEP, limits.nest_limit),
+        );
+    }
+    RegexError::new(ErrorKind::Syntax, error.to_string())
+}
+
+/// Fills a limit or an offset into a message.
+fn with_value(message: &str, value: impl std::fmt::Display) -> String {
+    message.replace("{value}", &value.to_string())
+}

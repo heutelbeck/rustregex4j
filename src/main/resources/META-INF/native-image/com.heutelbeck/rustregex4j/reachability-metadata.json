@@ -1,0 +1,7 @@
+{
+  "resources": [
+    { "glob": "com/heutelbeck/rustregex4j/engine/*/librustregex4j.so" },
+    { "glob": "com/heutelbeck/rustregex4j/engine/*/librustregex4j.dylib" },
+    { "glob": "com/heutelbeck/rustregex4j/engine/*/rustregex4j.dll" }
+  ]
+}

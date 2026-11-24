@@ -1,0 +1,47 @@
+[package]
+name = "rustregex4j"
+description = "The regex engine of rustregex4j: the Rust regex crate behind a JNI interface."
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/rustregex4j.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+regex = "=1.13.2"
+regex-syntax = "=0.8.12"
+jni-sys = "=0.4.1"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = "symbols"
+
+[lints.rust]
+warnings = "deny"
+unsafe_code = "deny"
+missing_docs = "deny"
+unreachable_pub = "deny"
+unused_qualifications = "deny"
+missing_debug_implementations = "deny"
+non_ascii_idents = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+exit = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+non_ascii_literal = "deny"
