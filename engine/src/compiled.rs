@@ -241,18 +241,36 @@ impl CompiledRegex {
         self.check_text(text)?;
         self.check_text(replacement)?;
         let mut result = String::new();
-        let mut last = 0;
+        let mut replaced = 0;
+        let mut replacement_lengths = None;
         for groups in self.regex.captures_iter(text) {
             let Some(found) = groups.get(0) else {
                 continue;
             };
-            result.push_str(text.get(last..found.start()).unwrap_or_default());
+            let unchanged = text.get(replaced..found.start()).unwrap_or_default();
+            let (literal_bytes, occurrences) =
+                replacement_lengths.get_or_insert_with(|| self.replacement_lengths(replacement));
+            let expanded = occurrences
+                .iter()
+                .try_fold(*literal_bytes, |size, (index, count)| {
+                    let captured = groups.get(*index).map_or(0, |group| group.len());
+                    captured
+                        .checked_mul(*count)
+                        .and_then(|bytes| size.checked_add(bytes))
+                });
+            self.check_result_size(
+                result
+                    .len()
+                    .checked_add(unchanged.len())
+                    .and_then(|size| expanded.and_then(|bytes| size.checked_add(bytes))),
+            )?;
+            result.push_str(unchanged);
             groups.expand(replacement, &mut result);
-            last = found.end();
-            self.check_result(&result)?;
+            replaced = found.end();
         }
-        result.push_str(text.get(last..).unwrap_or_default());
-        self.check_result(&result)?;
+        let tail = text.get(replaced..).unwrap_or_default();
+        self.check_result_size(result.len().checked_add(tail.len()))?;
+        result.push_str(tail);
         Ok(result)
     }
 
@@ -295,8 +313,34 @@ impl CompiledRegex {
         decode_utf16(text, ERROR_MALFORMED_TEXT)
     }
 
-    fn check_result(&self, result: &str) -> Result<(), RegexError> {
-        if result.len() > self.max_text_bytes {
+    fn replacement_lengths(&self, replacement: &str) -> (usize, Vec<(usize, usize)>) {
+        let mut occurrences = vec![0; self.regex.captures_len()];
+        let mut literals = String::with_capacity(replacement.len());
+        // Use the same interpolation grammar as Captures::expand, without copying captures.
+        regex_automata::util::interpolate::string(
+            replacement,
+            |index, _| {
+                if let Some(count) = occurrences.get_mut(index) {
+                    *count += 1;
+                }
+            },
+            |name| {
+                self.regex
+                    .capture_names()
+                    .position(|capture| capture == Some(name))
+            },
+            &mut literals,
+        );
+        let referenced = occurrences
+            .into_iter()
+            .enumerate()
+            .filter(|(_, count)| *count != 0)
+            .collect();
+        (literals.len(), referenced)
+    }
+
+    fn check_result_size(&self, size: Option<usize>) -> Result<(), RegexError> {
+        if size.is_none_or(|size| size > self.max_text_bytes) {
             return Err(RegexError::new(
                 ErrorKind::ResultTooLong,
                 with_value(ERROR_RESULT_TOO_LONG, self.max_text_bytes),

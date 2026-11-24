@@ -58,6 +58,42 @@ class ReplaceAndSplitTests {
                             result -> assertThat(result).isInstanceOfSatisfying(RegexError.class,
                                     error -> assertThat(error.kind()).isEqualTo(RegexErrorKind.TEXT_TOO_LONG)));
         }
+
+        static Stream<Arguments> boundedReplacements() {
+            return Stream.of(
+                    arguments("repeated capture at the limit", "(.+)", "a".repeat(64), "$0$0", 128, new Replaced("a".repeat(128))),
+                    arguments("repeated capture beyond the limit", "(.+)", "a".repeat(64), "$0$0", 127, resultTooLong(127)),
+                    arguments("capture expansion beyond the limit", "(.+)", "a".repeat(64), "$0".repeat(64), 256, resultTooLong(256)),
+                    arguments("nested captures", "(a(b))", "ab", "$1$2$1", 6, new Replaced("abbab")),
+                    arguments("unmatched and unknown names", "(?<a>x)?(?<b>y)", "y", "${a}$b${missing}", 16, new Replaced("y")),
+                    arguments("named and whole match", "(?<x_1>a)", "a", "$x_1$0", 6, new Replaced("aa")),
+                    arguments("a greedy unknown name", "(?<x_1>a)", "a", "$x_1z", 6, new Replaced("")),
+                    arguments("a Unicode capture name", "(?<\u03b1>a)", "a", "${\u03b1}", 8, new Replaced("a")),
+                    arguments("an escaped dollar", "(a)", "a", "$$1", 3, new Replaced("$1")),
+                    arguments("a bare dollar", "(a)", "a", "$", 1, new Replaced("$")),
+                    arguments("an unclosed reference", "(a)", "a", "${missing", 9, new Replaced("${missing")),
+                    arguments("an overflowing group number", "(a)", "a", "$999999999999999999999999", 28, new Replaced("")),
+                    arguments("successive replacements", "(b)", "abba", "$1$1$1", 6, resultTooLong(6)),
+                    arguments("the unchanged tail", "(a)", "ab", "xxxx", 4, resultTooLong(4)),
+                    arguments("UTF-8 capture bytes", "(.+)", "\u00e4", "$0$0", 4, new Replaced("\u00e4\u00e4")),
+                    arguments("zero width at the limit", "", "\u00e4", "-", 4, new Replaced("-\u00e4-")),
+                    arguments("zero width beyond the limit", "", "\u00e4", "-", 3, resultTooLong(3)),
+                    arguments("no match", "x", "abc", "yyyy", 4, new Replaced("abc")));
+        }
+
+        @MethodSource("boundedReplacements")
+        @ParameterizedTest(name = "{0}")
+        @DisplayName("preserve capture expansion and UTF-8 result limits")
+        void whenCaptureReplacementsApproachTheLimitThenTheResultRemainsBounded(String description, String pattern,
+                String text, String replacement, int limit, ReplaceResult expected) {
+            assertThat(compiled(pattern, RegexLimits.DEFAULT.withMaxTextBytes(limit)).replaceAll(text, replacement))
+                    .isEqualTo(expected);
+        }
+
+        private static RegexError resultTooLong(int limit) {
+            return new RegexError(RegexErrorKind.RESULT_TOO_LONG,
+                    "The result of the replacement is longer than %d UTF-8 bytes.".formatted(limit));
+        }
     }
 
     @Nested

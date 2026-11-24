@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 regex = "=1.13.2"
 regex-syntax = "=0.8.12"
+regex-automata = { version = "=0.4.19", default-features = false, features = ["alloc"] }
 jni-sys = "=0.4.1"
 
 [profile.release]
