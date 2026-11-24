@@ -79,6 +79,17 @@ class ReadmeExamplesTests {
     }
 
     @Test
+    @DisplayName("matching many patterns at once")
+    void whenMatchingASetThenAllMatchingPatternsAreReported() {
+        RegexSet routes = (RegexSet) RegexSet.compileWholeText(List.of("/users/[0-9]+", "/orders/[0-9]+", "/orders/.*"));
+        List<Integer> matching = switch (routes.matches("/orders/42")) {
+        case SetMatches(var patterns) -> patterns;
+        case RegexError error         -> List.of();
+        };
+        assertThat(matching).containsExactly(1, 2);
+    }
+
+    @Test
     @DisplayName("matching the whole text")
     void whenCompilingForTheWholeTextThenOnlySpanningMatchesCount() {
         Regex identifier = (Regex) Regex.compileWholeText("[a-z]{3}-[0-9]{6}");

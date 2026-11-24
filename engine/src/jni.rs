@@ -17,7 +17,9 @@ use jni_sys::{
     jstring,
 };
 
-use crate::compiled::{Anchoring, Captures, CompiledRegex, byte_offset_of_utf16, invalid_start};
+use crate::compiled::{
+    Anchoring, Captures, CompiledRegex, CompiledRegexSet, byte_offset_of_utf16, invalid_start,
+};
 use crate::error::{ErrorKind, RegexError};
 use crate::limits::Limits;
 use crate::positions::Span;
@@ -33,7 +35,7 @@ const GROUP_VALUES: usize = SPAN_VALUES + 1;
 /// Separates group names in the result of `groupNames`; group names cannot contain it.
 const NAME_SEPARATOR: char = '\u{0}';
 
-/// The number of compiled regexes not yet freed. It changes only on compile and free, never
+/// The number of compiled regexes and sets not yet freed. It changes only on compile and free, never
 /// during a search, so it costs searches nothing; tests use it to prove that every compiled
 /// regex is freed.
 static LIVE_REGEXES: AtomicI64 = AtomicI64::new(0);
@@ -128,6 +130,54 @@ unsafe fn store_message(env: *mut JNIEnv, target: jobjectArray, message: &str) {
     }
 }
 
+/// Converts the limits as Java passes them; a value out of range becomes 0 and refuses
+/// every pattern.
+fn limits_of(
+    max_pattern_bytes: jint,
+    nest_limit: jint,
+    size_limit: jlong,
+    dfa_size_limit: jlong,
+    max_text_bytes: jint,
+) -> Limits {
+    Limits {
+        max_pattern_bytes: usize::try_from(max_pattern_bytes).unwrap_or(0),
+        nest_limit: u32::try_from(nest_limit).unwrap_or(0),
+        size_limit: usize::try_from(size_limit).unwrap_or(0),
+        dfa_size_limit: usize::try_from(dfa_size_limit).unwrap_or(0),
+        max_text_bytes: usize::try_from(max_text_bytes).unwrap_or(0),
+    }
+}
+
+fn anchoring_of(whole_text: jboolean) -> Anchoring {
+    if whole_text {
+        Anchoring::WholeText
+    } else {
+        Anchoring::Anywhere
+    }
+}
+
+/// Copies the strings of a Java `String[]` as UTF-16 code units.
+///
+/// # Safety
+///
+/// `env` is the current JNI environment and `strings` a live `String[]` without null
+/// elements.
+unsafe fn read_strings(env: *mut JNIEnv, strings: jobjectArray) -> Vec<Vec<u16>> {
+    // SAFETY: guaranteed by the caller; every local reference is deleted after use, so a
+    // long array does not exhaust the local reference table.
+    unsafe {
+        let functions = &(**env).v1_2;
+        let length = (functions.GetArrayLength)(env, strings);
+        let mut result = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
+        for index in 0..length {
+            let element = (functions.GetObjectArrayElement)(env, strings, index);
+            result.push(read_string(env, element));
+            (functions.DeleteLocalRef)(env, element);
+        }
+        result
+    }
+}
+
 // Pointers travel to Java as `long`. The library supports 64-bit targets only, where a
 // pointer and a `long` have the same width, so the conversions below are lossless.
 #[cfg(not(target_pointer_width = "64"))]
@@ -141,6 +191,16 @@ fn to_handle(regex: Box<CompiledRegex>) -> jlong {
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn to_pointer(handle: jlong) -> *mut CompiledRegex {
     handle as usize as *mut CompiledRegex
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn to_set_handle(set: Box<CompiledRegexSet>) -> jlong {
+    Box::into_raw(set) as usize as jlong
+}
+
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn to_set_pointer(handle: jlong) -> *mut CompiledRegexSet {
+    handle as usize as *mut CompiledRegexSet
 }
 
 /// Returns the compiled regex behind a pointer from `compile`.
@@ -192,18 +252,14 @@ extern "system" fn Java_com_heutelbeck_rustregex4j_RegexEngine_compile(
     whole_text: jboolean,
     message: jobjectArray,
 ) -> jlong {
-    let limits = Limits {
-        max_pattern_bytes: usize::try_from(max_pattern_bytes).unwrap_or(0),
-        nest_limit: u32::try_from(nest_limit).unwrap_or(0),
-        size_limit: usize::try_from(size_limit).unwrap_or(0),
-        dfa_size_limit: usize::try_from(dfa_size_limit).unwrap_or(0),
-        max_text_bytes: usize::try_from(max_text_bytes).unwrap_or(0),
-    };
-    let anchoring = if whole_text {
-        Anchoring::WholeText
-    } else {
-        Anchoring::Anywhere
-    };
+    let limits = limits_of(
+        max_pattern_bytes,
+        nest_limit,
+        size_limit,
+        dfa_size_limit,
+        max_text_bytes,
+    );
+    let anchoring = anchoring_of(whole_text);
     let compiled = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: the Java side passes a live, non-null string.
         let units = unsafe { read_string(env, pattern) };
@@ -427,6 +483,94 @@ extern "system" fn Java_com_heutelbeck_rustregex4j_RegexEngine_split(
             Ok(values)
         })
     }
+}
+
+/// Compiles a set of patterns. Returns the pointer to the compiled set, or a negated
+/// [`ErrorKind`] code with the message stored in `message[0]`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+extern "system" fn Java_com_heutelbeck_rustregex4j_RegexEngine_compileSet(
+    env: *mut JNIEnv,
+    _class: jclass,
+    patterns: jobjectArray,
+    max_pattern_bytes: jint,
+    nest_limit: jint,
+    size_limit: jlong,
+    dfa_size_limit: jlong,
+    max_text_bytes: jint,
+    whole_text: jboolean,
+    message: jobjectArray,
+) -> jlong {
+    let limits = limits_of(
+        max_pattern_bytes,
+        nest_limit,
+        size_limit,
+        dfa_size_limit,
+        max_text_bytes,
+    );
+    let anchoring = anchoring_of(whole_text);
+    let compiled = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the Java side passes a live String[] without null elements.
+        let units = unsafe { read_strings(env, patterns) };
+        let mut decoded = Vec::with_capacity(units.len());
+        for pattern in &units {
+            decoded.push(CompiledRegex::decode_pattern(pattern)?);
+        }
+        CompiledRegexSet::compile(&decoded, &limits, anchoring)
+    }))
+    .unwrap_or_else(|_| Err(RegexError::new(ErrorKind::Internal, ERROR_PANIC)));
+    match compiled {
+        Ok(set) => {
+            LIVE_REGEXES.fetch_add(1, Ordering::Relaxed);
+            to_set_handle(Box::new(set))
+        }
+        Err(error) => {
+            // SAFETY: the Java side passes a live String[1].
+            unsafe { store_message(env, message, &error.message) };
+            jlong::from(status_of(error.kind))
+        }
+    }
+}
+
+/// Frees a compiled set.
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_heutelbeck_rustregex4j_RegexEngine_freeSet(
+    _env: *mut JNIEnv,
+    _class: jclass,
+    pointer: jlong,
+) {
+    // SAFETY: the Java side frees every pointer from `compileSet` exactly once.
+    drop(unsafe { Box::from_raw(to_set_pointer(pointer)) });
+    LIVE_REGEXES.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Matches all patterns of a set: `[count, pattern index, ...]` or `[negated error code]`.
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_heutelbeck_rustregex4j_RegexEngine_setMatches(
+    env: *mut JNIEnv,
+    _class: jclass,
+    pointer: jlong,
+    text: jstring,
+) -> jintArray {
+    let values = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the Java side passes a pointer from `compileSet` that is not yet freed,
+        // and a live, non-null string.
+        let (set, units) = unsafe { (&*to_set_pointer(pointer), read_string(env, text)) };
+        CompiledRegex::decode_text(&units)
+            .and_then(|decoded| set.matches(&decoded))
+            .map_or_else(
+                |error| vec![status_of(error.kind)],
+                |matched| {
+                    let mut values = Vec::with_capacity(1 + matched.len());
+                    values.push(to_jint(matched.len()));
+                    values.extend(matched.into_iter().map(to_jint));
+                    values
+                },
+            )
+    }))
+    .unwrap_or_else(|_| vec![status_of(ErrorKind::Internal)]);
+    // SAFETY: `env` is the current JNI environment.
+    unsafe { new_int_array(env, &values) }
 }
 
 /// Returns the number of compiled regexes not yet freed.

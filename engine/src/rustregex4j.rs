@@ -15,7 +15,7 @@ mod jni;
 mod limits;
 mod positions;
 
-pub use compiled::{Anchoring, Captures, CompiledRegex, byte_offset_of_utf16};
+pub use compiled::{Anchoring, Captures, CompiledRegex, CompiledRegexSet, byte_offset_of_utf16};
 pub use error::{ErrorKind, RegexError};
 pub use limits::Limits;
 pub use positions::{Position, Span};

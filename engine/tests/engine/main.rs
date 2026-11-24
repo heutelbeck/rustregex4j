@@ -9,6 +9,7 @@ mod compilation;
 mod memory;
 mod replace_and_split;
 mod search;
+mod sets;
 mod whole_text_and_iteration;
 
 use rustregex4j::{CompiledRegex, Limits};

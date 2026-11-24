@@ -1,6 +1,6 @@
 //! A compiled pattern and the searches on it.
 
-use regex::{Regex, RegexBuilder};
+use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use regex_syntax::ParserBuilder;
 use regex_syntax::ast;
 use regex_syntax::hir::{Hir, Look};
@@ -20,6 +20,8 @@ const ERROR_PATTERN_TOO_LARGE: &str =
 const ERROR_PATTERN_TOO_LONG: &str = "The pattern is longer than {value} UTF-8 bytes.";
 const ERROR_RESULT_TOO_LONG: &str =
     "The result of the replacement is longer than {value} UTF-8 bytes.";
+const ERROR_SET_TOO_LARGE: &str =
+    "The compiled set of patterns exceeds the size limit of {value} bytes.";
 const ERROR_TEXT_TOO_LONG: &str = "The text is longer than {value} UTF-8 bytes.";
 
 /// A compiled regular expression.
@@ -76,39 +78,7 @@ impl CompiledRegex {
         limits: &Limits,
         anchoring: Anchoring,
     ) -> Result<CompiledRegex, RegexError> {
-        if pattern.len() > limits.max_pattern_bytes {
-            return Err(RegexError::new(
-                ErrorKind::PatternTooLong,
-                with_value(ERROR_PATTERN_TOO_LONG, limits.max_pattern_bytes),
-            ));
-        }
-        let hir = ParserBuilder::new()
-            .nest_limit(limits.nest_limit)
-            .build()
-            .parse(pattern)
-            .map_err(|error| classify_syntax_error(&error, limits))?;
-        let compiled_pattern = match anchoring {
-            Anchoring::Anywhere => pattern.to_owned(),
-            Anchoring::WholeText => {
-                Hir::concat(vec![Hir::look(Look::Start), hir, Hir::look(Look::End)]).to_string()
-            }
-        };
-        // The parser above already enforced the nest limit on the pattern as written. The
-        // canonical text that the builder parses again may nest deeper, for example by the
-        // group that encloses the anchors, so the builder gets headroom and never rejects
-        // what the parser admitted.
-        let regex = RegexBuilder::new(&compiled_pattern)
-            .nest_limit(limits.nest_limit.saturating_mul(2).saturating_add(2))
-            .size_limit(limits.size_limit)
-            .dfa_size_limit(limits.dfa_size_limit)
-            .build()
-            .map_err(|error| match error {
-                regex::Error::CompiledTooBig(limit) => RegexError::new(
-                    ErrorKind::PatternTooLarge,
-                    with_value(ERROR_PATTERN_TOO_LARGE, limit),
-                ),
-                other => RegexError::new(ErrorKind::Syntax, other.to_string()),
-            })?;
+        let (_, regex) = prepare(pattern, limits, anchoring)?;
         let group_names = regex
             .capture_names()
             .map(|name| name.map(str::to_owned))
@@ -307,6 +277,15 @@ impl CompiledRegex {
         Ok(resolve_spans(text, &ranges).into_iter().flatten().collect())
     }
 
+    /// Decodes a pattern given as UTF-16 code units.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::MalformedUnicode`] for an unpaired surrogate.
+    pub fn decode_pattern(pattern: &[u16]) -> Result<String, RegexError> {
+        decode_utf16(pattern, ERROR_MALFORMED_PATTERN)
+    }
+
     /// Decodes a text given as UTF-16 code units for searching.
     ///
     /// # Errors
@@ -327,14 +306,121 @@ impl CompiledRegex {
     }
 
     fn check_text(&self, text: &str) -> Result<(), RegexError> {
-        if text.len() > self.max_text_bytes {
-            return Err(RegexError::new(
-                ErrorKind::TextTooLong,
-                with_value(ERROR_TEXT_TOO_LONG, self.max_text_bytes),
-            ));
-        }
-        Ok(())
+        check_text_length(text, self.max_text_bytes)
     }
+}
+
+/// A set of compiled patterns that one search matches against a text all at once.
+///
+/// Every pattern is checked and compiled on its own first, so a set holds no pattern that
+/// [`CompiledRegex`] refuses. The patterns then share one program, whose size may reach the
+/// size limit of a single pattern times the number of patterns.
+#[derive(Debug, Clone)]
+pub struct CompiledRegexSet {
+    set: RegexSet,
+    max_text_bytes: usize,
+}
+
+impl CompiledRegexSet {
+    /// Compiles the patterns into one set.
+    ///
+    /// # Errors
+    ///
+    /// The error of the first pattern that [`CompiledRegex::compile_anchored`] refuses, or
+    /// [`ErrorKind::PatternTooLarge`] if the set as a whole is too large.
+    pub fn compile(
+        patterns: &[String],
+        limits: &Limits,
+        anchoring: Anchoring,
+    ) -> Result<CompiledRegexSet, RegexError> {
+        let mut prepared = Vec::with_capacity(patterns.len());
+        for pattern in patterns {
+            prepared.push(prepare(pattern, limits, anchoring)?.0);
+        }
+        let size_limit = limits.size_limit.saturating_mul(patterns.len().max(1));
+        let set = RegexSetBuilder::new(&prepared)
+            .nest_limit(limits.nest_limit.saturating_mul(2).saturating_add(2))
+            .size_limit(size_limit)
+            .dfa_size_limit(limits.dfa_size_limit)
+            .build()
+            .map_err(|error| match error {
+                regex::Error::CompiledTooBig(limit) => RegexError::new(
+                    ErrorKind::PatternTooLarge,
+                    with_value(ERROR_SET_TOO_LARGE, limit),
+                ),
+                other => RegexError::new(ErrorKind::Syntax, other.to_string()),
+            })?;
+        Ok(CompiledRegexSet {
+            set,
+            max_text_bytes: limits.max_text_bytes,
+        })
+    }
+
+    /// Returns the number of patterns in the set.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    /// Reports whether the set holds no pattern.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    /// Returns the indexes of the patterns that match the text, in ascending order.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::TextTooLong`] if the text exceeds the text length limit.
+    pub fn matches(&self, text: &str) -> Result<Vec<usize>, RegexError> {
+        check_text_length(text, self.max_text_bytes)?;
+        Ok(self.set.matches(text).into_iter().collect())
+    }
+}
+
+/// Checks a pattern against the limits and compiles it. Returns the text the engine
+/// compiled, which for [`Anchoring::WholeText`] is the canonical text of the enclosed
+/// syntax tree, together with the compiled regex.
+fn prepare(
+    pattern: &str,
+    limits: &Limits,
+    anchoring: Anchoring,
+) -> Result<(String, Regex), RegexError> {
+    if pattern.len() > limits.max_pattern_bytes {
+        return Err(RegexError::new(
+            ErrorKind::PatternTooLong,
+            with_value(ERROR_PATTERN_TOO_LONG, limits.max_pattern_bytes),
+        ));
+    }
+    let hir = ParserBuilder::new()
+        .nest_limit(limits.nest_limit)
+        .build()
+        .parse(pattern)
+        .map_err(|error| classify_syntax_error(&error, limits))?;
+    let compiled_pattern = match anchoring {
+        Anchoring::Anywhere => pattern.to_owned(),
+        Anchoring::WholeText => {
+            Hir::concat(vec![Hir::look(Look::Start), hir, Hir::look(Look::End)]).to_string()
+        }
+    };
+    // The parser above already enforced the nest limit on the pattern as written. The
+    // canonical text that the builder parses again may nest deeper, for example by the
+    // group that encloses the anchors, so the builder gets headroom and never rejects
+    // what the parser admitted.
+    let regex = RegexBuilder::new(&compiled_pattern)
+        .nest_limit(limits.nest_limit.saturating_mul(2).saturating_add(2))
+        .size_limit(limits.size_limit)
+        .dfa_size_limit(limits.dfa_size_limit)
+        .build()
+        .map_err(|error| match error {
+            regex::Error::CompiledTooBig(limit) => RegexError::new(
+                ErrorKind::PatternTooLarge,
+                with_value(ERROR_PATTERN_TOO_LARGE, limit),
+            ),
+            other => RegexError::new(ErrorKind::Syntax, other.to_string()),
+        })?;
+    Ok((compiled_pattern, regex))
 }
 
 /// Converts a UTF-16 offset into the byte offset of the same position in `text`; `None` if
@@ -352,6 +438,16 @@ pub fn byte_offset_of_utf16(text: &str, utf16_offset: usize) -> Option<usize> {
         }
     }
     (units == utf16_offset).then_some(text.len())
+}
+
+fn check_text_length(text: &str, max_text_bytes: usize) -> Result<(), RegexError> {
+    if text.len() > max_text_bytes {
+        return Err(RegexError::new(
+            ErrorKind::TextTooLong,
+            with_value(ERROR_TEXT_TOO_LONG, max_text_bytes),
+        ));
+    }
+    Ok(())
 }
 
 fn group_ranges(groups: &regex::Captures<'_>) -> Vec<Option<(usize, usize)>> {

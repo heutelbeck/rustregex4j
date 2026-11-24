@@ -77,7 +77,7 @@ public final class Regex implements RegexCompilation {
     private static final String ERROR_TEXT_NULL        = "The text must not be null.";
     private static final String ERROR_TEXT_TOO_LONG    = "The text is longer than %d UTF-8 bytes.";
 
-    private static final Cleaner CLEANER = Cleaner.create();
+    static final Cleaner CLEANER = Cleaner.create();
 
     private static final int    FOUND          = 1;
     private static final int    SPAN_VALUES    = 4;

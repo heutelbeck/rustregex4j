@@ -3,8 +3,9 @@ package com.heutelbeck.rustregex4j;
 /**
  * The JNI interface of the regex engine, the Rust library behind {@link Regex}.
  * <p>
- * Contract: arguments are never null; a pointer comes from {@link #compile} and goes to
- * {@link #free} exactly once; no method receives a pointer after {@link #free}. The array
+ * Contract: arguments and array elements are never null; a pointer comes from
+ * {@link #compile} and goes to {@link #free} exactly once, or from {@link #compileSet} and
+ * goes to {@link #freeSet} exactly once; no method receives a pointer after it was freed. The array
  * results start with a status: {@code 1} found, {@code 0} not found, or a negated
  * {@link RegexErrorKind} code. A span is four values: UTF-16 start, UTF-16 end, code point
  * start, code point end.
@@ -55,6 +56,20 @@ final class RegexEngine {
     /** @return {@code [count, span...]} of at most {@code limit} parts, or {@code [negated error kind code]} */
     static native int[] split(long pointer, String text, int limit);
 
-    /** @return the number of compiled regexes not yet freed */
+    /**
+     * Compiles a set of patterns.
+     *
+     * @return the pointer to the compiled set, or a negated error kind code with the message
+     *         stored in {@code message[0]}
+     */
+    static native long compileSet(String[] patterns, int maxPatternBytes, int nestLimit, long sizeLimit,
+            long dfaSizeLimit, int maxTextBytes, boolean wholeText, String[] message);
+
+    static native void freeSet(long pointer);
+
+    /** @return {@code [count, pattern index...]} of the matching patterns, or {@code [negated error kind code]} */
+    static native int[] setMatches(long pointer, String text);
+
+    /** @return the number of compiled regexes and sets not yet freed */
     static native long liveRegexes();
 }

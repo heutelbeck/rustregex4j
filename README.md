@@ -126,6 +126,18 @@ List<String> fields = switch (comma.split("a,b,,c", 100)) {
 
 Both behave as `replace_all` and `splitn` of the crate. In a replacement, `$1` and `${1}` insert a group by number, `$name` and `${name}` by name, and `$$` inserts `$`; every other character, the backslash included, stands for itself. A group that does not exist or did not participate inserts nothing. `$name` takes the longest name of letters, digits and `_`, so write `${1}a` for group 1 followed by `a`. A split keeps empty parts, also at the start and the end, and the last part holds the rest of the text once the limit is reached. A result of `replaceAll` longer than `maxTextBytes` is rejected as `RESULT_TOO_LONG`.
 
+### Matching many patterns at once
+
+```java
+RegexSet routes = (RegexSet) RegexSet.compileWholeText(List.of("/users/[0-9]+", "/orders/[0-9]+", "/orders/.*"));
+List<Integer> matching = switch (routes.matches("/orders/42")) {
+    case SetMatches(var patterns) -> patterns;
+    case RegexError error         -> List.of();
+};
+```
+
+A `RegexSet` is the `RegexSet` of the crate: one search reports the indexes of all patterns that match, here `[1, 2]`, in time linear in the length of the text instead of one search per pattern. Use it where many patterns are tested against the same text. A set reports which patterns match, not where; it has no positions and no capture groups. Every pattern is compiled on its own first, so a set is rejected for the reason its pattern would be rejected alone. The patterns then share one compiled program, whose size may reach `sizeLimit` times the number of patterns.
+
 ### Searching from many threads
 
 A `Regex` is immutable and thread-safe. Compile it once and share it. Searches do not lock; each thread uses its own matching cache inside the Rust crate.

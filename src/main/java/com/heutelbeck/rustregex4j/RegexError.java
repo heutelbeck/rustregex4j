@@ -15,7 +15,7 @@ import static java.util.Objects.requireNonNull;
  */
 public record RegexError(RegexErrorKind kind, String message)
         implements RegexCompilation, IsMatchResult, FindResult, FindAllResult, CapturesResult, CapturesAllResult,
-        ReplaceResult, SplitResult {
+        ReplaceResult, SplitResult, RegexSetCompilation, SetMatchesResult {
 
     private static final String ERROR_KIND_NULL    = "The error kind must not be null.";
     private static final String ERROR_MESSAGE_NULL = "The error message must not be null.";
